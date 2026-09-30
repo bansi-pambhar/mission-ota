@@ -1,0 +1,31 @@
+# /********************************************************************************
+# * Copyright (c) 2023 Contributors to the Eclipse Foundation
+# *
+# * See the NOTICE file(s) distributed with this work for additional
+# * information regarding copyright ownership.
+# *
+# * This program and the accompanying materials are made available under the
+# * terms of the Apache License 2.0 which is available at
+# * https://www.apache.org/licenses/LICENSE-2.0
+# *
+# * SPDX-License-Identifier: Apache-2.0
+# ********************************************************************************/
+
+# General
+leda.target: Leda QEMU X86-64
+leda.target.hostname: leda-x86.leda-network
+leda.sshport: 2222
+leda.ethernet.interface: enp0s2
+
+# The MQTT broker hostname and port number (target device)
+broker.uri: leda-x86
+broker.port: 1883
+
+# File which contains the update request message
+start_update_filename: robot-resources/start-update-example-x86.json
+rauc.update.bundle.filename: sdv-rauc-bundle-minimal-qemux86-64.raucb
+
+# Kuksa Databroker: How the Robot can reach the databroker
+# The port mapping is done by docker-compose, hence localhost
+kuksa_hostname: leda-x86.leda-network
+kuksa_port: 30555

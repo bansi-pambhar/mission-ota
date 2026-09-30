@@ -1,0 +1,26 @@
+diff --git a/agent/src/runtime_connectors/containerd/nerdctl_cli.rs b/agent/src/runtime_connectors/containerd/nerdctl_cli.rs
+index 2bc81fe1..6c4701fc 100644
+--- a/agent/src/runtime_connectors/containerd/nerdctl_cli.rs
++++ b/agent/src/runtime_connectors/containerd/nerdctl_cli.rs
+@@ -431,14 +431,17 @@ fn parse_labels<'a, D>(deserializer: D) -> Result<HashMap<String, String>, D::Er
+ where
+     D: Deserializer<'a>,
+ {
+-    let raw_labels: String = Deserialize::deserialize(deserializer)?;
++    let raw_labels: Option<String> = Deserialize::deserialize(deserializer)?;
+     let mut labels = HashMap::new();
+ 
+-    for part in raw_labels.split(',') {
+-        if let Some((key, value)) = part.split_once('=') {
+-            labels.insert(key.to_string(), value.to_string());
++    if let Some(raw_labels) = raw_labels {
++        for part in raw_labels.split(',') {
++            if let Some((key, value)) = part.split_once('=') {
++                labels.insert(key.to_string(), value.to_string());
++            }
+         }
+     }
++
+     Ok(labels)
+ }
+ 

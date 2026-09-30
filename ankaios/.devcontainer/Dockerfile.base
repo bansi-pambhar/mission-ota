@@ -1,0 +1,165 @@
+# Copyright (c) 2023 Elektrobit Automotive GmbH
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License, Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+ARG USERNAME=vscode
+
+# All the packages we need
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt update && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        apt install -y gcc-aarch64-linux-gnu; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        apt install -y gcc-x86-64-linux-gnu; \
+    fi \
+    && apt -y install \
+    # Basics
+    git \
+    zsh \
+    curl \
+    unzip \
+    iputils-ping \
+    sudo \
+    # java for plantuml
+    default-jre \
+    graphviz \
+    # MkDocs Material and social card
+    python3 \
+    python3-pip \
+    libcairo2-dev \
+    libfreetype6-dev \
+    libffi-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libz-dev \
+    pngquant \
+    # Others
+    protobuf-compiler \
+    protobuf-compiler-grpc \
+    tmux \
+    vim \
+    uidmap \
+    fuse3 \
+    fuse-overlayfs \
+    slirp4netns \
+    help2man \
+    ripgrep \
+    # container engines
+    podman \
+    containerd \
+    # TLS
+    musl-tools \
+    # Cleanup
+    && rm -rf /var/lib/apt/lists/*
+
+# Workaround for podman not being able to stop containers, see https://bugs.launchpad.net/ubuntu/noble/+source/libpod/+bug/2040483
+RUN mkdir -p /etc/containers/containers.conf.d \
+    && printf '[CONTAINERS]\napparmor_profile=""\n' > /etc/containers/containers.conf.d/disable-apparmor.conf
+
+# Install nerdctl compatible to containerd v1.7
+RUN curl -Ls https://github.com/containerd/nerdctl/releases/download/v2.1.3/nerdctl-2.1.3-linux-${TARGETARCH}.tar.gz | sudo tar Cxzvvf /usr/local/bin - \
+    && chmod +s /usr/local/bin/nerdctl
+
+# User management
+RUN (userdel -r ubuntu || true) \
+    && groupadd rustlang \
+    && useradd -s /bin/bash -d /home/${USERNAME} -m -G rustlang ${USERNAME} \
+    && echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+
+# Prepare shells
+USER ${USERNAME}
+COPY --chown=${USERNAME}:${USERNAME} dot_bashrc /home/${USERNAME}/.bashrc
+COPY --chown=${USERNAME}:${USERNAME} dot_zshrc /home/${USERNAME}/.zshrc
+COPY --chown=${USERNAME}:${USERNAME} dot_tmux.conf /home/${USERNAME}/.tmux.conf
+RUN curl -sS https://starship.rs/install.sh | sh -s -- -y \
+    && echo 'eval "$(starship init bash)"' >> /home/${USERNAME}/.bashrc \
+    && echo 'eval "$(starship init zsh)"' >> /home/${USERNAME}/.zshrc
+COPY --chown=${USERNAME}:${USERNAME} starship.toml /home/${USERNAME}/.config/
+USER root
+
+# Rust
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=$CARGO_HOME/bin:$PATH
+RUN mkdir -p -m 2777 $RUSTUP_HOME \
+    && chgrp rustlang $RUSTUP_HOME \
+    && mkdir -p -m 2777 $CARGO_HOME \
+    && chgrp rustlang $CARGO_HOME \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+       sh -s -- -y --default-toolchain 1.94 --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl --no-modify-path \
+    && chmod -R ag+w $RUSTUP_HOME $CARGO_HOME
+
+# required for Podman
+VOLUME /var/lib/containers
+# required for containerd
+VOLUME /var/lib/containerd
+
+COPY containers.conf /etc/containers/containers.conf
+RUN chmod 644 /etc/containers/containers.conf
+
+# install just
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        ITEMARCH="x86_64"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        ITEMARCH="aarch64"; \
+    else \
+        exit 1; \
+    fi; \
+    curl -sL https://github.com/casey/just/releases/download/1.57.0/just-1.57.0-${ITEMARCH}-unknown-linux-musl.tar.gz | \
+    tar xz --directory=/usr/local/bin just \
+    && echo 'source <(just --completions bash)' >> /home/${USERNAME}/.bashrc \
+    && echo 'source <(just --completions zsh)' >> /home/${USERNAME}/.zshrc
+
+# install grpcurl
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        ITEMARCH="x86_64"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        ITEMARCH="arm64"; \
+    else \
+        exit 1; \
+    fi; \
+    curl -sL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_${ITEMARCH}.tar.gz | \
+    tar xz --no-same-owner --directory=/usr/local/bin grpcurl
+
+# OpenFastTrace
+RUN curl -sL https://github.com/itsallcode/openfasttrace/releases/download/4.7.0/openfasttrace-4.7.0.jar -o /usr/local/bin/openfasttrace.jar
+COPY oft /usr/local/bin
+
+# The plantuml version is synchronized with the one of the VS code extension.
+RUN curl -sL https://github.com/plantuml/plantuml/releases/download/v1.2024.3/plantuml.jar -o /usr/local/bin/plantuml.jar
+COPY plantuml /usr/local/bin
+
+# MkDocs Material
+RUN PIP_BREAK_SYSTEM_PACKAGES=1 pip install mkdocs-material pillow cairosvg mike mkdocs-htmlproofer-plugin mkdocs-llmstxt robotframework==7.4.2 markdown==3.10.2
+
+# protoc-gen-doc
+RUN curl -sL https://github.com/pseudomuto/protoc-gen-doc/releases/download/v1.5.1/protoc-gen-doc_1.5.1_linux_${TARGETARCH}.tar.gz | tar xz --directory=/usr/local/bin protoc-gen-doc
+
+# Before installing cargo tools, change to the user that will be used in the container later.
+# The reason is that cargo creates some cache, etc. folders with the correct group rustlang, but
+# without making them group writable. Easiest fix is to change to the correct user before the install,
+# s.t. the owner is correct from the start.
+USER ${USERNAME}
+
+# Install cargo cli tools
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked; \
+    cargo install cargo-deb --locked; \
+    cargo install cargo-nextest --locked; \
+    cargo install cargo-deny --locked; \
+    cargo install cargo-about --features=cli --locked
+
+USER root

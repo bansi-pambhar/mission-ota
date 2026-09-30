@@ -1,0 +1,531 @@
+// Copyright (c) 2023 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::log_fetcher::LogFetcher;
+use crate::{runtime_connectors::StateCheckerHandle, workload_state::WorkloadStateSender};
+
+use ankaios_api::ank_base::{
+    ExecutionStateSpec, LogsRequest, WorkloadInstanceNameSpec, WorkloadNamed, WorkloadStateSpec,
+};
+use common::objects::AgentName;
+
+use async_trait::async_trait;
+use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuntimeWorkloadId(String);
+
+impl Display for RuntimeWorkloadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for RuntimeWorkloadId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RuntimeWorkloadId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl FromStr for RuntimeWorkloadId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl AsRef<str> for RuntimeWorkloadId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<RuntimeWorkloadId> for String {
+    fn from(value: RuntimeWorkloadId) -> String {
+        value.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RuntimeError {
+    Create(String),
+    Delete(String),
+    List(String),
+    CollectLog(String),
+    Unsupported(String),
+}
+
+// [impl->swdd~agent-log-request-configuration~1]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct LogRequestOptions {
+    pub follow: bool,
+    pub tail: Option<i32>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+impl Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeError::Create(msg) => {
+                write!(f, "{msg}")
+            }
+            RuntimeError::Delete(msg) => {
+                write!(f, "{msg}")
+            }
+            RuntimeError::List(msg) => {
+                write!(f, "{msg}")
+            }
+            RuntimeError::CollectLog(msg) => {
+                write!(f, "{msg}")
+            }
+            RuntimeError::Unsupported(msg) => {
+                write!(f, "{msg}")
+            }
+        }
+    }
+}
+
+impl From<LogsRequest> for LogRequestOptions {
+    fn from(value: LogsRequest) -> Self {
+        Self {
+            follow: value.follow.unwrap_or_default(),
+            tail: value.tail,
+            since: value.since,
+            until: value.until,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReusableWorkloadState {
+    pub workload_state: WorkloadStateSpec,
+    pub workload_id: Option<String>,
+}
+
+impl ReusableWorkloadState {
+    pub fn new(
+        instance_name: WorkloadInstanceNameSpec,
+        execution_state: ExecutionStateSpec,
+        workload_id: Option<String>,
+    ) -> ReusableWorkloadState {
+        ReusableWorkloadState {
+            workload_state: WorkloadStateSpec {
+                instance_name,
+                execution_state,
+            },
+            workload_id,
+        }
+    }
+}
+
+// [impl->swdd~agent-functions-required-by-runtime-connector~1]
+#[async_trait]
+pub trait RuntimeConnector: Sync + Send {
+    fn name(&self) -> String;
+
+    async fn get_reusable_workloads(
+        &self,
+        agent_name: &AgentName,
+    ) -> Result<Vec<ReusableWorkloadState>, RuntimeError>;
+
+    async fn create_workload(
+        &self,
+        runtime_workload_config: WorkloadNamed,
+        reusable_workload_id: Option<RuntimeWorkloadId>,
+        control_interface_path: Option<PathBuf>,
+        update_state_tx: WorkloadStateSender,
+        workload_file_path_mapping: HashMap<PathBuf, PathBuf>,
+    ) -> Result<(RuntimeWorkloadId, StateCheckerHandle), RuntimeError>;
+
+    async fn get_workload_id(
+        &self,
+        instance_name: &WorkloadInstanceNameSpec,
+    ) -> Result<RuntimeWorkloadId, RuntimeError>;
+
+    async fn start_checker(
+        &self,
+        workload_id: &RuntimeWorkloadId,
+        runtime_workload_config: WorkloadNamed,
+        update_state_tx: WorkloadStateSender,
+    ) -> Result<StateCheckerHandle, RuntimeError>;
+
+    fn get_log_fetcher(
+        &self,
+        workload_id: RuntimeWorkloadId,
+        options: &LogRequestOptions,
+    ) -> Result<Box<dyn LogFetcher + Send>, RuntimeError>;
+
+    async fn delete_workload(&self, workload_id: &RuntimeWorkloadId) -> Result<(), RuntimeError>;
+}
+
+pub trait OwnableRuntime: RuntimeConnector {
+    fn to_owned(&self) -> Box<dyn RuntimeConnector>;
+}
+
+impl<R> OwnableRuntime for R
+where
+    R: RuntimeConnector + Clone + 'static,
+{
+    fn to_owned(&self) -> Box<dyn RuntimeConnector> {
+        Box::new(self.clone())
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+pub mod test {
+    use super::{LogRequestOptions, RuntimeConnector, RuntimeError, RuntimeWorkloadId};
+    use crate::{
+        runtime_connectors::{
+            ReusableWorkloadState, StateChecker, StateCheckerHandle, log_fetcher::LogFetcher,
+        },
+        workload_state::WorkloadStateSender,
+    };
+
+    use ankaios_api::ank_base::{WorkloadInstanceNameSpec, WorkloadNamed};
+    use common::objects::AgentName;
+
+    use async_trait::async_trait;
+    use std::{
+        collections::{HashMap, VecDeque},
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Debug)]
+    pub struct StubStateChecker {
+        panic_if_not_stopped: bool,
+    }
+
+    impl StubStateChecker {
+        pub fn new() -> Self {
+            StubStateChecker {
+                panic_if_not_stopped: false,
+            }
+        }
+
+        pub fn panic_if_not_stopped(&mut self) {
+            self.panic_if_not_stopped = true;
+        }
+    }
+
+    #[async_trait]
+    impl StateChecker for StubStateChecker {
+        async fn stop_checker(mut self: Box<Self>) {
+            log::info!("Stopping the checker ;)");
+            self.panic_if_not_stopped = false;
+        }
+    }
+
+    impl Drop for StubStateChecker {
+        fn drop(&mut self) {
+            if self.panic_if_not_stopped {
+                panic!("The StubStateChecker was not stopped");
+            }
+        }
+    }
+
+    pub enum RuntimeCall {
+        GetReusableWorkloads(AgentName, Result<Vec<ReusableWorkloadState>, RuntimeError>),
+        CreateWorkload(
+            WorkloadNamed,
+            Option<String>,
+            Option<PathBuf>,
+            HashMap<PathBuf, PathBuf>,
+            Result<(RuntimeWorkloadId, StateCheckerHandle), RuntimeError>,
+        ),
+        GetWorkloadId(
+            WorkloadInstanceNameSpec,
+            Result<RuntimeWorkloadId, RuntimeError>,
+        ),
+        StartChecker(
+            String,
+            WorkloadNamed,
+            WorkloadStateSender,
+            Result<StateCheckerHandle, RuntimeError>,
+        ),
+        DeleteWorkload(String, Result<(), RuntimeError>),
+        StartLogFetcher(
+            LogRequestOptions,
+            Result<Box<dyn LogFetcher + Send>, RuntimeError>,
+        ),
+    }
+
+    impl std::fmt::Debug for RuntimeCall {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let variant_name = match self {
+                RuntimeCall::GetReusableWorkloads(_, _) => "GetReusableWorkloads",
+                RuntimeCall::CreateWorkload(_, _, _, _, _) => "CreateWorkload",
+                RuntimeCall::GetWorkloadId(_, _) => "GetWorkloadId",
+                RuntimeCall::StartChecker(_, _, _, _) => "StartChecker",
+                RuntimeCall::DeleteWorkload(_, _) => "DeleteWorkload",
+                RuntimeCall::StartLogFetcher(_, _) => "StartLogFetcher",
+            };
+
+            write!(f, "{variant_name}")
+        }
+    }
+
+    #[derive(Debug)]
+    struct CallChecker<CallType>
+    where
+        CallType: std::fmt::Debug,
+    {
+        pub expected_calls: VecDeque<CallType>,
+        pub unexpected_call_count: i8,
+    }
+
+    impl<CallType> CallChecker<CallType>
+    where
+        CallType: std::fmt::Debug,
+    {
+        pub fn new() -> Self {
+            CallChecker {
+                expected_calls: VecDeque::new(),
+                unexpected_call_count: 0,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MockBase<CallType>
+    where
+        CallType: std::fmt::Debug,
+    {
+        call_checker: Arc<Mutex<CallChecker<CallType>>>,
+    }
+
+    impl<CallType> MockBase<CallType>
+    where
+        CallType: std::fmt::Debug,
+    {
+        pub fn new() -> Self {
+            MockBase {
+                call_checker: Arc::new(Mutex::new(CallChecker::new())),
+            }
+        }
+
+        pub fn expect(&mut self, calls: Vec<CallType>) {
+            self.call_checker
+                .lock()
+                .unwrap()
+                .expected_calls
+                .append(&mut VecDeque::from(calls));
+        }
+
+        fn get_expected_call(&self) -> CallType {
+            let mut call_checker = self.call_checker.lock().unwrap();
+            match call_checker.expected_calls.pop_front() {
+                Some(call) => call,
+                None => {
+                    call_checker.unexpected_call_count += 1;
+                    panic!("No more calls expected");
+                }
+            }
+        }
+
+        pub fn unexpected_call(&self) {
+            self.call_checker.lock().unwrap().unexpected_call_count += 1;
+        }
+
+        pub fn assert_all_expectations(self) {
+            let call_checker = self.call_checker.lock().unwrap();
+
+            assert!(
+                call_checker.expected_calls.is_empty(),
+                "Not all expected calls were done: {call_checker:?}"
+            );
+            assert!(
+                0 == call_checker.unexpected_call_count,
+                "Received an unexpected amount of calls: '{:?}'",
+                call_checker.unexpected_call_count
+            );
+        }
+    }
+
+    // This had to be implemented manually.
+    // The auto derived Clone does not understand that CallType doesn't need to be Clone
+    impl<CallType> Clone for MockBase<CallType>
+    where
+        CallType: std::fmt::Debug,
+    {
+        fn clone(&self) -> Self {
+            Self {
+                call_checker: self.call_checker.clone(),
+            }
+        }
+    }
+
+    pub type MockRuntimeConnector = MockBase<RuntimeCall>;
+
+    #[async_trait]
+    impl RuntimeConnector for MockBase<RuntimeCall> {
+        fn name(&self) -> String {
+            "mock-runtime".to_string()
+        }
+
+        async fn get_reusable_workloads(
+            &self,
+            agent_name: &AgentName,
+        ) -> Result<Vec<ReusableWorkloadState>, RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::GetReusableWorkloads(expected_agent_name, result)
+                    if expected_agent_name == *agent_name =>
+                {
+                    return result;
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected get_reusable_running_workloads call. Expected: '{expected_call:?}'\n\nGot: {agent_name:?}"
+                    );
+                }
+            }
+        }
+
+        async fn create_workload(
+            &self,
+            runtime_workload_config: WorkloadNamed,
+            reusable_workload_id: Option<RuntimeWorkloadId>,
+            control_interface_path: Option<PathBuf>,
+            _update_state_tx: WorkloadStateSender,
+            host_workload_file_path_mappings: HashMap<PathBuf, PathBuf>,
+        ) -> Result<(RuntimeWorkloadId, StateCheckerHandle), RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::CreateWorkload(
+                    expected_runtime_workload_config,
+                    expected_reusable_workload_id,
+                    expected_control_interface_path,
+                    expected_host_workload_file_path_mappings,
+                    result,
+                ) if expected_runtime_workload_config == runtime_workload_config
+                    && expected_reusable_workload_id
+                        == reusable_workload_id.as_ref().map(ToString::to_string)
+                    && expected_control_interface_path == control_interface_path
+                    && host_workload_file_path_mappings
+                        == expected_host_workload_file_path_mappings =>
+                {
+                    return result;
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected create_workload call. Expected: '{expected_call:?}'\n\nGot: {runtime_workload_config:?}, {control_interface_path:?}"
+                    );
+                }
+            }
+        }
+
+        async fn get_workload_id(
+            &self,
+            instance_name: &WorkloadInstanceNameSpec,
+        ) -> Result<RuntimeWorkloadId, RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::GetWorkloadId(expected_instance_name, result)
+                    if expected_instance_name == *instance_name =>
+                {
+                    return result;
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected get_workload_id call. Expected: '{expected_call:?}' \n\nGot: {instance_name:?}"
+                    );
+                }
+            }
+        }
+
+        async fn start_checker(
+            &self,
+            workload_id: &RuntimeWorkloadId,
+            runtime_workload_config: WorkloadNamed,
+            update_state_tx: WorkloadStateSender,
+        ) -> Result<StateCheckerHandle, RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::StartChecker(
+                    expected_workload_id,
+                    expected_runtime_workload_config,
+                    expected_update_state_tx,
+                    result,
+                ) if expected_workload_id == workload_id.to_string()
+                    && expected_runtime_workload_config == runtime_workload_config
+                    && expected_update_state_tx.same_channel(&update_state_tx) =>
+                {
+                    return result;
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected start_checker call. Expected: '{expected_call:?}' \n\nGot: {workload_id:?}, {runtime_workload_config:?}, {update_state_tx:?}"
+                    );
+                }
+            }
+        }
+
+        fn get_log_fetcher(
+            &self,
+            workload_id: RuntimeWorkloadId,
+            options: &LogRequestOptions,
+        ) -> Result<Box<dyn LogFetcher + Send>, RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::StartLogFetcher(expected_options, result)
+                    if expected_options == *options =>
+                {
+                    result
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected get_logs call. Expected: '{expected_call:?}'\n\nGot: {workload_id:?}, {options:?}"
+                    );
+                }
+            }
+        }
+
+        async fn delete_workload(
+            &self,
+            workload_id: &RuntimeWorkloadId,
+        ) -> Result<(), RuntimeError> {
+            match self.get_expected_call() {
+                RuntimeCall::DeleteWorkload(expected_workload_id, result)
+                    if expected_workload_id == workload_id.to_string() =>
+                {
+                    return result;
+                }
+                expected_call => {
+                    self.unexpected_call();
+                    panic!(
+                        "Unexpected delete_workload call. Expected: '{expected_call:?}'\n\nGot: {workload_id:?}"
+                    );
+                }
+            }
+        }
+    }
+}

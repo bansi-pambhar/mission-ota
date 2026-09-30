@@ -1,0 +1,31 @@
+target
+/build
+temp
+req_in
+dist
+logs
+vendor
+/debian
+
+#ignore plantuml out folder
+/out
+
+#ignore profiling data
+*.profraw
+*.profdata
+**/coverage
+.cache
+.certs
+
+# ignore python data
+__pycache__
+
+# Vgarant
+**/.vagrant
+
+# ignore nohup file for postStartCommand
+nohup.out
+
+# Claude local config
+.claude/settings.local.json
+

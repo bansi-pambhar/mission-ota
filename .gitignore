@@ -1,0 +1,58 @@
+# ============================================================
+# Mission OTA - GitHub exclusions
+# ============================================================
+
+# Secrets / private keys
+ota-keys/ota-private.pem
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Build outputs
+**/target/
+target/
+build/
+dist/
+
+# Large VM / firmware artifacts
+*.qcow2
+*.wic
+*.raucb
+*.tar.gz
+*.tar.xz
+*.tgz
+
+# QEMU / runtime artifacts
+*.pid
+*.sock
+*.log
+*.img
+
+# Temporary OTA test files
+mission-ota-v2-tampered.tar.gz
+/tmp/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Nested upstream Git repositories
+ankaios/.git/
+leda/.git/
+leda-utils/.git/
+
+# Example/private signing and TLS material
+**/examples/**/private/
+**/examples/**/*.key
+**/examples/**/*.csr
+
+# Upstream example credentials / keys
+leda-distro/examples/nginx/*.key
+leda-distro/examples/example-ca/private/
+leda-qemu/examples/nginx/*.key
+leda-qemu/examples/example-ca/private/
+leda-distro/resources/docker-snapshot/dockerfiles/grafana/grafana.ini
+leda-distro/resources/docker-release/dockerfiles/grafana/grafana.ini

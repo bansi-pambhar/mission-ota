@@ -1,0 +1,44 @@
+@startuml seq_cmd_startup
+!include ../../../../resources/doc/plantuml/clean.skin
+
+box "Ankaios Ank"
+    actor "user" as user
+    participant Main as main
+    participant "Cli" as cli
+    participant "CliCommands" as cli_commands
+    participant "ServerConnection" as server_connection
+    participant "<<task>>\nCommunications Client" as communications_client
+end box
+
+box "Ankaios Server"
+    participant "Ankaios Server" as server
+end box
+
+user-> main ++ : a command
+
+== startup ==
+
+main -> main ++--: load ank CLI config file
+note right: The precedence of means of configuring the Ankaios CLI\n is the following: Ankaios ank CLI arguments,\n environment variables and after that the CLI configuration file.
+main -> cli **
+main -> cli ++: parse
+cli ->> main --
+main -> cli_commands ** : init
+activate cli_commands
+cli_commands -> server_connection ** :
+deactivate cli_commands
+activate server_connection
+
+server_connection ->> communications_client ** : create and start in a new task
+deactivate server_connection
+activate communications_client
+
+communications_client ->> server ++: connect to server
+note left: if the connection is lost,\nwill try to reconnect
+communications_client -> communications_client: start listening for ToServer\nand FromServer messages
+
+== command ==
+
+... implementation ...
+
+@enduml

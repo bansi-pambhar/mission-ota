@@ -1,0 +1,779 @@
+// Copyright (c) 2023 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{
+    io_utils::FileSystemError,
+    runtime_connectors::{OwnableRuntime, ReusableWorkloadState, RuntimeError, RuntimeWorkloadId},
+    workload::WorkloadCommandSender,
+    workload::control_loop_state::ControlLoopState,
+    workload_operation::ReusableWorkload,
+    workload_state::{WorkloadStateSender, WorkloadStateSenderInterface},
+};
+
+use ankaios_api::ank_base::{ExecutionStateSpec, WorkloadInstanceNameSpec, WorkloadNamed};
+use common::objects::AgentName;
+use common::std_extensions::IllegalStateResult;
+
+use async_trait::async_trait;
+use std::path::PathBuf;
+use tokio::task::JoinHandle;
+
+#[cfg_attr(test, mockall_double::double)]
+use crate::control_interface::ControlInterface;
+#[cfg_attr(test, mockall_double::double)]
+use crate::control_interface::control_interface_info::ControlInterfaceInfo;
+#[cfg_attr(test, mockall_double::double)]
+use crate::io_utils::filesystem_async;
+#[cfg_attr(test, mockall_double::double)]
+use crate::workload::Workload;
+#[cfg_attr(test, mockall_double::double)]
+use crate::workload::workload_control_loop::WorkloadControlLoop;
+#[cfg(test)]
+use mockall::automock;
+
+#[async_trait]
+#[cfg_attr(test, automock)]
+pub trait RuntimeFacade: Send + Sync + 'static {
+    async fn get_reusable_workloads(
+        &self,
+        agent_name: &AgentName,
+    ) -> Result<Vec<ReusableWorkloadState>, RuntimeError>;
+
+    fn create_workload(
+        &self,
+        runtime_workload: ReusableWorkload,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> Workload;
+
+    fn resume_workload(
+        &self,
+        runtime_workload: WorkloadNamed,
+        control_interface: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> Workload;
+
+    fn delete_workload(
+        &self,
+        instance_name: WorkloadInstanceNameSpec,
+        update_state_tx: &WorkloadStateSender,
+    );
+}
+
+pub struct GenericRuntimeFacade {
+    runtime: Box<dyn OwnableRuntime>,
+    run_folder: PathBuf,
+}
+
+impl GenericRuntimeFacade {
+    pub fn new(runtime: Box<dyn OwnableRuntime>, run_folder: PathBuf) -> Self {
+        GenericRuntimeFacade {
+            runtime,
+            run_folder,
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeFacade for GenericRuntimeFacade {
+    // [impl->swdd~agent-facade-forwards-list-reusable-workloads-call~1]
+    async fn get_reusable_workloads(
+        &self,
+        agent_name: &AgentName,
+    ) -> Result<Vec<ReusableWorkloadState>, RuntimeError> {
+        log::debug!(
+            "Searching for reusable '{}' workloads on agent '{}'.",
+            self.runtime.name(),
+            agent_name
+        );
+        self.runtime.get_reusable_workloads(agent_name).await
+    }
+
+    // [impl->swdd~agent-create-workload~2]
+    fn create_workload(
+        &self,
+        reusable_workload: ReusableWorkload,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> Workload {
+        let (_task_handle, workload) = Self::create_workload_non_blocking(
+            self,
+            reusable_workload,
+            control_interface_info,
+            update_state_tx,
+        );
+        workload
+    }
+
+    // [impl->swdd~agent-resume-workload~2]
+    fn resume_workload(
+        &self,
+        runtime_workload: WorkloadNamed,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> Workload {
+        let (_task_handle, workload) = Self::resume_workload_non_blocking(
+            self,
+            runtime_workload,
+            control_interface_info,
+            update_state_tx,
+        );
+        workload
+    }
+
+    // [impl->swdd~agent-delete-old-workload~3]
+    fn delete_workload(
+        &self,
+        instance_name: WorkloadInstanceNameSpec,
+        update_state_tx: &WorkloadStateSender,
+    ) {
+        let _task_handle = Self::delete_workload_non_blocking(self, instance_name, update_state_tx);
+    }
+}
+
+impl GenericRuntimeFacade {
+    // [impl->swdd~agent-create-workload~2]
+    fn create_workload_non_blocking(
+        &self,
+        reusable_workload: ReusableWorkload,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> (JoinHandle<()>, Workload) {
+        let workload_named = reusable_workload.workload_named;
+        let workload_id = reusable_workload.runtime_workload_id;
+
+        let runtime = self.runtime.to_owned();
+        let update_state_tx = update_state_tx.clone();
+        let workload_name = workload_named.instance_name.workload_name().to_owned();
+
+        let (control_interface_path, control_interface) = if let Some(info) = control_interface_info
+        {
+            let control_interface_path = info.get_control_interface_path().clone();
+            let output_pipe_sender = info.get_to_server_sender();
+            let instance_name = info.get_instance_name().clone();
+            let authorizer = info.move_authorizer();
+            match ControlInterface::new(
+                control_interface_path.clone(),
+                &instance_name,
+                output_pipe_sender,
+                authorizer,
+            ) {
+                Ok(control_interface) => {
+                    log::info!(
+                        "Successfully created control interface for workload '{workload_name}'."
+                    );
+                    (Some(control_interface_path), Some(control_interface))
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Could not create control interface when creating workload '{workload_name}': '{err}'"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            log::debug!("Skipping creation of control interface for workload '{workload_name}'.");
+            (None, None)
+        };
+
+        log::debug!(
+            "Creating '{}' workload '{}'.",
+            runtime.name(),
+            workload_name,
+        );
+
+        let (workload_command_tx, workload_command_receiver) = WorkloadCommandSender::new();
+        let workload_command_sender = workload_command_tx.clone();
+        let run_folder = self.run_folder.clone();
+        let task_handle = tokio::spawn(async move {
+            workload_command_sender
+                .create()
+                .await
+                .unwrap_or_else(|err| {
+                    log::warn!("Failed to send workload command create: '{err}'");
+                });
+
+            let control_loop_state = ControlLoopState::builder()
+                .workload_named(workload_named)
+                .workload_id(workload_id.map(RuntimeWorkloadId::from))
+                .control_interface_path(control_interface_path)
+                .run_folder(run_folder)
+                .workload_state_sender(update_state_tx)
+                .runtime(runtime)
+                .workload_command_receiver(workload_command_receiver)
+                .retry_sender(workload_command_sender)
+                .build()
+                .unwrap_or_illegal_state();
+
+            WorkloadControlLoop::run(control_loop_state).await
+        });
+
+        (
+            task_handle,
+            Workload::new(workload_name, workload_command_tx, control_interface),
+        )
+    }
+
+    // [impl->swdd~agent-resume-workload~2]
+    fn resume_workload_non_blocking(
+        &self,
+        workload_named: WorkloadNamed,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        update_state_tx: &WorkloadStateSender,
+    ) -> (JoinHandle<()>, Workload) {
+        let workload_name = workload_named.instance_name.workload_name().to_owned();
+        let runtime = self.runtime.to_owned();
+        let update_state_tx = update_state_tx.clone();
+
+        log::debug!(
+            "Resuming '{}' workload '{}'.",
+            runtime.name(),
+            workload_name,
+        );
+
+        // [impl->swdd~agent-control-interface-created-for-eligible-workloads~1]
+        let control_interface = if let Some(info) = control_interface_info {
+            let control_interface_path = info.get_control_interface_path().clone();
+            let output_pipe_sender = info.get_to_server_sender();
+            let instance_name = info.get_instance_name().clone();
+            let authorizer = info.move_authorizer();
+            match ControlInterface::new(
+                control_interface_path,
+                &instance_name,
+                output_pipe_sender,
+                authorizer,
+            ) {
+                Ok(control_interface) => Some(control_interface),
+                Err(err) => {
+                    log::warn!(
+                        "Could not reuse or create control interface when resuming workload '{}': '{}'",
+                        workload_named.instance_name,
+                        err
+                    );
+                    None
+                }
+            }
+        } else {
+            log::info!(
+                "No control interface access rights specified for resumed workload '{}'. Skipping creation of control interface.",
+                workload_named.instance_name.clone().workload_name()
+            );
+            None
+        };
+
+        let (workload_command_tx, workload_command_receiver) = WorkloadCommandSender::new();
+        let workload_command_sender = workload_command_tx.clone();
+        workload_command_sender.resume().unwrap_or_else(|err| {
+            log::warn!("Failed to send workload command resume: '{err}'");
+        });
+
+        let run_folder = self.run_folder.clone();
+        let task_handle = tokio::spawn(async move {
+            let control_loop_state = ControlLoopState::builder()
+                .workload_named(workload_named)
+                .workload_state_sender(update_state_tx)
+                .runtime(runtime)
+                .run_folder(run_folder)
+                .workload_command_receiver(workload_command_receiver)
+                .retry_sender(workload_command_sender)
+                .build()
+                .unwrap_or_illegal_state();
+
+            WorkloadControlLoop::run(control_loop_state).await
+        });
+
+        (
+            task_handle,
+            Workload::new(workload_name, workload_command_tx, control_interface),
+        )
+    }
+
+    // [impl->swdd~agent-delete-old-workload~3]
+    fn delete_workload_non_blocking(
+        &self,
+        instance_name: WorkloadInstanceNameSpec,
+        update_state_tx: &WorkloadStateSender,
+    ) -> JoinHandle<()> {
+        let runtime = self.runtime.to_owned();
+        let update_state_tx = update_state_tx.clone();
+
+        log::debug!(
+            "Deleting '{}' workload '{}' on agent '{}'",
+            runtime.name(),
+            instance_name.workload_name(),
+            instance_name.agent_name(),
+        );
+
+        let run_folder = self.run_folder.clone();
+        tokio::spawn(async move {
+            update_state_tx
+                .report_workload_execution_state(
+                    &instance_name,
+                    ExecutionStateSpec::stopping_requested(),
+                )
+                .await;
+
+            if let Ok(id) = runtime.get_workload_id(&instance_name).await {
+                if let Err(err) = runtime.delete_workload(&id).await {
+                    update_state_tx
+                        .report_workload_execution_state(
+                            &instance_name,
+                            ExecutionStateSpec::delete_failed(err),
+                        )
+                        .await;
+
+                    return; // The early exit is needed to skip sending the removed message.
+                }
+            } else {
+                log::debug!("Workload '{instance_name}' already gone.");
+            }
+
+            log::debug!("Deleting the workload subfolder of workload '{instance_name}'");
+
+            let workload_dir = instance_name.pipes_folder_name(&run_folder);
+            match filesystem_async::remove_dir_all(&workload_dir).await {
+                Ok(_) => {
+                    log::trace!(
+                        "Successfully deleted workload subfolder of workload '{instance_name}'"
+                    );
+                }
+                Err(FileSystemError::NotFoundDirectory(_)) => {
+                    log::debug!(
+                        "Workload subfolder for '{instance_name}' already missing, skipping deletion."
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to delete workload subfolder after deletion of workload '{instance_name}': '{err}'"
+                    );
+                }
+            }
+
+            update_state_tx
+                .report_workload_execution_state(&instance_name, ExecutionStateSpec::removed())
+                .await;
+        })
+    }
+}
+
+#[cfg(test)]
+mockall::mock! {
+    pub GenericRuntimeFacade {
+        pub fn new(runtime: Box<dyn OwnableRuntime>,
+            run_folder: PathBuf) -> Self;
+    }
+
+    #[async_trait]
+    impl RuntimeFacade for GenericRuntimeFacade {
+        async fn get_reusable_workloads(
+            &self,
+            agent_name: &AgentName,
+        ) -> Result<Vec<ReusableWorkloadState>, RuntimeError>;
+
+        fn create_workload(
+            &self,
+            runtime_workload: ReusableWorkload,
+            control_interface_info: Option<ControlInterfaceInfo>,
+            update_state_tx: &WorkloadStateSender,
+        ) -> Workload;
+
+        fn resume_workload(
+            &self,
+            runtime_workload: WorkloadNamed,
+            control_interface: Option<ControlInterfaceInfo>,
+            update_state_tx: &WorkloadStateSender,
+        ) -> Workload;
+
+        fn delete_workload(
+            &self,
+            instance_name: WorkloadInstanceNameSpec,
+            update_state_tx: &WorkloadStateSender,
+        );
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        control_interface::{
+            ControlInterfacePath, MockControlInterface, authorizer::MockAuthorizer,
+            control_interface_info::MockControlInterfaceInfo,
+        },
+        io_utils::mock_filesystem_async,
+        runtime_connectors::{
+            GenericRuntimeFacade, OwnableRuntime, ReusableWorkloadState, RuntimeFacade,
+            runtime_connector::test::{MockRuntimeConnector, RuntimeCall},
+        },
+        workload::{ControlLoopState, MockWorkload, MockWorkloadControlLoop},
+        workload_operation::ReusableWorkload,
+        workload_state::assert_execution_state_sequence,
+    };
+
+    use ankaios_api::ank_base::{ExecutionStateSpec, WorkloadInstanceNameSpec};
+    use ankaios_api::test_utils::{fixtures, generate_test_workload_named};
+
+    // [utest->swdd~agent-facade-forwards-list-reusable-workloads-call~1]
+    #[tokio::test]
+    async fn utest_runtime_facade_reusable_running_workloads() {
+        let mut runtime_mock = MockRuntimeConnector::new();
+
+        let workload_instance_name = WorkloadInstanceNameSpec::builder()
+            .workload_name(fixtures::WORKLOAD_NAMES[0])
+            .build();
+
+        let workload_state = ReusableWorkloadState::new(
+            workload_instance_name.clone(),
+            ExecutionStateSpec::initial(),
+            None,
+        );
+
+        runtime_mock.expect(vec![RuntimeCall::GetReusableWorkloads(
+            fixtures::AGENT_NAMES[0].into(),
+            Ok(vec![workload_state]),
+        )]);
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        assert_eq!(
+            test_runtime_facade
+                .get_reusable_workloads(&fixtures::AGENT_NAMES[0].into())
+                .await
+                .unwrap()
+                .iter()
+                .map(|x| x.workload_state.instance_name.clone())
+                .collect::<Vec<WorkloadInstanceNameSpec>>(),
+            vec![workload_instance_name]
+        );
+
+        runtime_mock.assert_all_expectations();
+    }
+
+    // [utest->swdd~agent-create-workload~2]
+    #[tokio::test]
+    async fn utest_runtime_facade_create_workload() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let reusable_workload = ReusableWorkload::new(
+            generate_test_workload_named(),
+            Some(fixtures::WORKLOAD_IDS[0].to_string()),
+        );
+
+        let control_interface_mock = MockControlInterface::default();
+        let control_interface_new_context = MockControlInterface::new_context();
+        control_interface_new_context
+            .expect()
+            .once()
+            .return_once(|_, _, _, _| Ok(control_interface_mock));
+
+        let mut control_interface_info_mock = MockControlInterfaceInfo::default();
+        control_interface_info_mock
+            .expect_get_control_interface_path()
+            .once()
+            .return_const(ControlInterfacePath::new(fixtures::PIPES_LOCATION.into()));
+
+        control_interface_info_mock
+            .expect_get_to_server_sender()
+            .once()
+            .return_const(tokio::sync::mpsc::channel::<common::to_server_interface::ToServer>(1).0);
+
+        control_interface_info_mock
+            .expect_get_instance_name()
+            .once()
+            .return_const(reusable_workload.workload_named.instance_name.clone());
+
+        control_interface_info_mock
+            .expect_move_authorizer()
+            .once()
+            .return_once(MockAuthorizer::default);
+
+        let (wl_state_sender, _wl_state_receiver) =
+            tokio::sync::mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let mock_workload = MockWorkload::default();
+        let new_workload_context = MockWorkload::new_context();
+        new_workload_context
+            .expect()
+            .once()
+            .return_once(|_, _, _| mock_workload);
+
+        let mut runtime_mock = MockRuntimeConnector::new();
+        runtime_mock.expect(vec![]);
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        let mock_control_loop = MockWorkloadControlLoop::run_context();
+        mock_control_loop
+            .expect()
+            .once()
+            .return_once(|_: ControlLoopState| ());
+
+        let (task_handle, _workload) = test_runtime_facade.create_workload_non_blocking(
+            reusable_workload.clone(),
+            Some(control_interface_info_mock),
+            &wl_state_sender,
+        );
+
+        tokio::task::yield_now().await;
+
+        assert!(task_handle.await.is_ok());
+        runtime_mock.assert_all_expectations();
+    }
+
+    // [utest->swdd~agent-resume-workload~2]
+    // [utest->swdd~agent-control-interface-created-for-eligible-workloads~1]
+    #[tokio::test]
+    async fn utest_runtime_facade_resume_workload_with_control_interface_access() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let mut control_interface_info_mock = MockControlInterfaceInfo::default();
+        control_interface_info_mock
+            .expect_get_control_interface_path()
+            .once()
+            .return_const(ControlInterfacePath::new(fixtures::PIPES_LOCATION.into()));
+        control_interface_info_mock
+            .expect_get_to_server_sender()
+            .once()
+            .return_const(tokio::sync::mpsc::channel::<common::to_server_interface::ToServer>(1).0);
+        control_interface_info_mock
+            .expect_get_instance_name()
+            .once()
+            .return_const(
+                WorkloadInstanceNameSpec::builder()
+                    .workload_name(fixtures::WORKLOAD_NAMES[0])
+                    .build(),
+            );
+        control_interface_info_mock
+            .expect_move_authorizer()
+            .once()
+            .return_once(MockAuthorizer::default);
+
+        let control_interface_new_context = MockControlInterface::new_context();
+        control_interface_new_context
+            .expect()
+            .once()
+            .return_once(|_, _, _, _| Ok(MockControlInterface::default()));
+
+        let workload = generate_test_workload_named();
+
+        let (wl_state_sender, _wl_state_receiver) =
+            tokio::sync::mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let mock_control_loop = MockWorkloadControlLoop::run_context();
+        mock_control_loop
+            .expect()
+            .once()
+            .return_once(|_: ControlLoopState| ());
+
+        let mock_workload = MockWorkload::default();
+        let new_workload_context = MockWorkload::new_context();
+        new_workload_context
+            .expect()
+            .once()
+            .return_once(|_, _, _| mock_workload);
+
+        let runtime_mock = MockRuntimeConnector::new();
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        let (task_handle, _workload) = test_runtime_facade.resume_workload_non_blocking(
+            workload.clone(),
+            Some(control_interface_info_mock),
+            &wl_state_sender,
+        );
+
+        tokio::task::yield_now().await;
+        assert!(task_handle.await.is_ok());
+        runtime_mock.assert_all_expectations();
+    }
+
+    // [utest->swdd~agent-control-interface-created-for-eligible-workloads~1]
+    #[tokio::test]
+    async fn utest_runtime_facade_resume_workload_without_control_interface_access() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let control_interface_new_context = MockControlInterface::new_context();
+        control_interface_new_context.expect().never();
+
+        let workload = generate_test_workload_named();
+
+        let (wl_state_sender, _wl_state_receiver) =
+            tokio::sync::mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let mock_control_loop = MockWorkloadControlLoop::run_context();
+        mock_control_loop
+            .expect()
+            .once()
+            .return_once(|_: ControlLoopState| ());
+
+        let mock_workload = MockWorkload::default();
+        let new_workload_context = MockWorkload::new_context();
+        new_workload_context
+            .expect()
+            .once()
+            .return_once(|_, _, _| mock_workload);
+
+        let runtime_mock = MockRuntimeConnector::new();
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        let (task_handle, _workload) = test_runtime_facade.resume_workload_non_blocking(
+            workload.clone(),
+            None,
+            &wl_state_sender,
+        );
+
+        tokio::task::yield_now().await;
+        assert!(task_handle.await.is_ok());
+        runtime_mock.assert_all_expectations();
+    }
+
+    // [utest->swdd~agent-delete-old-workload~3]
+    #[tokio::test]
+    async fn utest_runtime_facade_delete_workload() {
+        let mut runtime_mock = MockRuntimeConnector::new();
+
+        let (wl_state_sender, wl_state_receiver) =
+            tokio::sync::mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let workload_instance_name = WorkloadInstanceNameSpec::builder()
+            .workload_name(fixtures::WORKLOAD_NAMES[0])
+            .build();
+
+        runtime_mock.expect(vec![
+            RuntimeCall::GetWorkloadId(
+                workload_instance_name.clone(),
+                Ok(fixtures::WORKLOAD_IDS[0].into()),
+            ),
+            RuntimeCall::DeleteWorkload(fixtures::WORKLOAD_IDS[0].to_string(), Ok(())),
+        ]);
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        let mock_remove_dir = mock_filesystem_async::remove_dir_all_context();
+        mock_remove_dir.expect().once().returning(|_| Ok(()));
+
+        test_runtime_facade.delete_workload(workload_instance_name.clone(), &wl_state_sender);
+
+        tokio::task::yield_now().await;
+
+        assert_execution_state_sequence(
+            wl_state_receiver,
+            vec![
+                (
+                    &workload_instance_name,
+                    ExecutionStateSpec::stopping_requested(),
+                ),
+                (&workload_instance_name, ExecutionStateSpec::removed()),
+            ],
+        )
+        .await;
+
+        runtime_mock.assert_all_expectations();
+    }
+
+    // [utest->swdd~agent-delete-old-workload~3]
+    #[tokio::test]
+    async fn utest_runtime_facade_delete_workload_failed() {
+        let mut runtime_mock = MockRuntimeConnector::new();
+
+        let (wl_state_sender, wl_state_receiver) =
+            tokio::sync::mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let workload_instance_name = WorkloadInstanceNameSpec::builder()
+            .workload_name(fixtures::WORKLOAD_NAMES[0])
+            .build();
+
+        runtime_mock.expect(vec![
+            RuntimeCall::GetWorkloadId(
+                workload_instance_name.clone(),
+                Ok(fixtures::WORKLOAD_IDS[0].into()),
+            ),
+            RuntimeCall::DeleteWorkload(
+                fixtures::WORKLOAD_IDS[0].to_string(),
+                Err(crate::runtime_connectors::RuntimeError::Delete(
+                    "delete failed".to_owned(),
+                )),
+            ),
+        ]);
+
+        let ownable_runtime_mock: Box<dyn OwnableRuntime> =
+            Box::new(runtime_mock.clone());
+        let test_runtime_facade = Box::new(GenericRuntimeFacade::new(
+            ownable_runtime_mock,
+            fixtures::RUN_FOLDER.into(),
+        ));
+
+        test_runtime_facade.delete_workload(workload_instance_name.clone(), &wl_state_sender);
+
+        tokio::task::yield_now().await;
+
+        assert_execution_state_sequence(
+            wl_state_receiver,
+            vec![
+                (
+                    &workload_instance_name,
+                    ExecutionStateSpec::stopping_requested(),
+                ),
+                (
+                    &workload_instance_name,
+                    ExecutionStateSpec::delete_failed("delete failed".to_owned()),
+                ),
+            ],
+        )
+        .await;
+
+        runtime_mock.assert_all_expectations();
+    }
+}

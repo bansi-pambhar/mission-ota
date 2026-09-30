@@ -1,0 +1,37 @@
+[package]
+name = "ank-server"
+version = "1.1.0-pre"
+edition = "2024"
+license = "Apache-2.0"
+description = "Eclipse Ankaios server component"
+documentation = "https://eclipse-ankaios.github.io/ankaios"
+authors = ["Elektrobit Automotive GmbH and Ankaios contributors"]
+repository = "https://github.com/eclipse-ankaios/ankaios"
+
+[dependencies]
+ankaios-api = { path = "../ankaios_api" }
+common = { path = "../common" }
+grpc = { path = "../grpc" }
+prost = "0.14"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1.41", features = [
+    "macros",
+    "rt-multi-thread",
+    "fs",
+    "io-util",
+    "process",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4.5", features = ["derive", "env"] }
+handlebars = "6.1.0"
+toml = "0.9"
+tempfile = "3.17"
+regex = "1.12"
+
+[dev-dependencies]
+ankaios-api = { path = "../ankaios_api", features = ["test_utils"] }
+common = { path = "../common", features = ["test_utils"] }
+mockall = "0.11"
+mockall_double = "0.3"

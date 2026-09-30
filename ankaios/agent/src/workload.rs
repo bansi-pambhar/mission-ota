@@ -1,0 +1,748 @@
+// Copyright (c) 2023 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// mod exports
+pub mod control_loop_state;
+pub mod retry_manager;
+pub mod workload_command_channel;
+pub mod workload_control_loop;
+
+// public api exports
+pub use control_loop_state::ControlLoopState;
+#[cfg_attr(test, mockall_double::double)]
+use retry_manager::RetryToken;
+use tokio::sync::oneshot;
+pub use workload_command_channel::WorkloadCommandSender;
+#[cfg(test)]
+pub use workload_control_loop::MockWorkloadControlLoop;
+
+use std::{error::Error, fmt::Display};
+
+#[cfg_attr(test, mockall_double::double)]
+use crate::control_interface::ControlInterface;
+#[cfg_attr(test, mockall_double::double)]
+use crate::control_interface::control_interface_info::ControlInterfaceInfo;
+use crate::{
+    control_interface::ControlInterfacePath,
+    runtime_connectors::{LogRequestOptions, log_fetcher::LogFetcher},
+};
+
+use ankaios_api::ank_base::{self, WorkloadInstanceNameSpec, WorkloadNamed};
+
+use common::from_server_interface::FromServer;
+
+#[cfg(test)]
+use mockall::automock;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkloadError {
+    Communication(String),
+    CompleteState(String),
+}
+
+impl Display for WorkloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkloadError::Communication(msg) => {
+                write!(f, "Could not send command to workload task: '{msg}'")
+            }
+            WorkloadError::CompleteState(msg) => {
+                write!(f, "Could not forward complete state '{msg}'")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WorkloadCommand {
+    Delete,
+    Update(Option<Box<WorkloadNamed>>, Option<ControlInterfacePath>),
+    Retry(Box<WorkloadInstanceNameSpec>, RetryToken),
+    Create,
+    Resume,
+    StartLogFetcher(LogRequestOptions, oneshot::Sender<Box<dyn LogFetcher>>),
+}
+
+#[cfg(test)]
+impl PartialEq for WorkloadCommand {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Delete, Self::Delete) => true,
+            (Self::Update(l0, l1), Self::Update(r0, r1)) => (l0, l1) == (r0, r1),
+            (Self::Retry(l0, l1), Self::Retry(r0, r1)) => (l0, l1) == (r0, r1),
+            (Self::Create, Self::Create) => true,
+            (Self::Resume, Self::Resume) => true,
+            (Self::StartLogFetcher(_, _), Self::StartLogFetcher(_, _)) => false,
+            _ => false,
+        }
+    }
+}
+
+pub struct Workload {
+    name: String,
+    channel: WorkloadCommandSender,
+    control_interface: Option<ControlInterface>,
+}
+
+#[cfg_attr(test, automock)]
+impl Workload {
+    pub fn new(
+        name: String,
+        channel: WorkloadCommandSender,
+        control_interface: Option<ControlInterface>,
+    ) -> Self {
+        Workload {
+            name,
+            channel,
+            control_interface,
+        }
+    }
+
+    fn exchange_control_interface(
+        &mut self,
+        control_interface_info: Option<ControlInterfaceInfo>,
+        control_interface_access: bool,
+    ) {
+        if let Some(control_interface) = self.control_interface.take() {
+            control_interface.abort_control_interface_task()
+        }
+
+        if control_interface_access {
+            self.control_interface = None;
+            return;
+        }
+
+        self.control_interface = control_interface_info.and_then(|info| {
+            let control_interface_path = info.get_control_interface_path().clone();
+            let output_pipe_sender = info.get_to_server_sender();
+            let instance_name = info.get_instance_name().clone();
+            let authorizer = info.move_authorizer();
+            match ControlInterface::new(
+                control_interface_path,
+                &instance_name,
+                output_pipe_sender,
+                authorizer,
+            ) {
+                Ok(control_interface) => Some(control_interface),
+                Err(err) => {
+                    log::warn!("Could not exchange control interface. Error: '{err}'");
+                    None
+                }
+            }
+        });
+    }
+
+    // [impl->swdd~agent-compares-control-interface-metadata~2]
+    fn is_control_interface_changed(
+        &self,
+        control_interface_info: &Option<ControlInterfaceInfo>,
+    ) -> bool {
+        match (&self.control_interface, control_interface_info) {
+            (None, None) => false,
+            (Some(current), Some(new_context)) => !new_context.has_same_configuration(current),
+            _ => true,
+        }
+    }
+
+    // [impl->swdd~agent-workload-obj-update-command~2]
+    pub async fn update(
+        &mut self,
+        workload_named: Option<WorkloadNamed>,
+        control_interface_info: Option<ControlInterfaceInfo>,
+    ) -> Result<(), WorkloadError> {
+        log::info!("Updating workload '{}'.", self.name);
+
+        if self.is_control_interface_changed(&control_interface_info) {
+            // [impl->swdd~agent-control-interface-created-for-eligible-workloads~1]
+            self.exchange_control_interface(
+                control_interface_info,
+                workload_named.clone().is_some_and(|workload_named| {
+                    !workload_named.workload.needs_control_interface()
+                }),
+            );
+        }
+
+        let control_interface_path = self
+            .control_interface
+            .as_ref()
+            .map(|control_interface| control_interface.get_api_location());
+
+        log::debug!("Send WorkloadCommand::Update.");
+        self.channel
+            .update(workload_named, control_interface_path)
+            .await
+            .map_err(|err| WorkloadError::Communication(err.to_string()))
+    }
+
+    // [impl->swdd~agent-workload-obj-delete-command~1]
+    pub async fn delete(self) -> Result<(), WorkloadError> {
+        log::info!("Deleting workload '{}'.", self.name);
+
+        if let Some(control_interface) = self.control_interface {
+            control_interface.abort_control_interface_task()
+        }
+
+        self.channel
+            .delete()
+            .await
+            .map_err(|err| WorkloadError::Communication(err.to_string()))
+    }
+
+    // [impl->swdd~agent-forward-responses-to-control-interface-pipe~1]
+    pub async fn forward_response(
+        &mut self,
+        response: ank_base::Response,
+    ) -> Result<(), WorkloadError> {
+        let control_interface =
+            self.control_interface
+                .as_ref()
+                .ok_or(WorkloadError::CompleteState(
+                    "control interface not available".to_string(),
+                ))?;
+        control_interface
+            .get_input_pipe_sender()
+            .send(FromServer::Response(response))
+            .await
+            .map_err(|err| WorkloadError::CompleteState(err.to_string()))
+    }
+
+    // [impl->swdd~agent-workload-obj-start-log-fetcher-command~1]
+    pub async fn start_collecting_logs(
+        &self,
+        log_request_options: LogRequestOptions,
+    ) -> Result<Box<dyn LogFetcher>, Box<dyn Error>> {
+        self.channel
+            .start_collecting_logs(log_request_options)
+            .await
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        control_interface::{
+            ControlInterfacePath, MockControlInterface, authorizer::MockAuthorizer,
+            control_interface_info::MockControlInterfaceInfo,
+        },
+        runtime_connectors::{LogRequestOptions, log_fetcher::MockLogFetcher},
+        workload::{Workload, WorkloadCommand, WorkloadCommandSender, WorkloadError},
+    };
+
+    use ankaios_api::ank_base::{self, CompleteStateSpec, Response, response::ResponseContent};
+    use ankaios_api::test_utils::{
+        generate_test_complete_state, generate_test_workload_named,
+        generate_test_workload_named_with_params, generate_test_workload_with_params, fixtures,
+    };
+    use common::from_server_interface::FromServer;
+
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::{sync::mpsc, time::timeout};
+
+    const LOG_REQUEST_OPTIONS: LogRequestOptions = LogRequestOptions {
+        follow: true,
+        tail: Some(100),
+        since: None,
+        until: None,
+    };
+
+    use mockall::lazy_static;
+
+    lazy_static! {
+        pub static ref CONTROL_INTERFACE_PATH: ControlInterfacePath =
+            ControlInterfacePath::new(PathBuf::from(fixtures::PIPES_LOCATION));
+    }
+
+    // [utest->swdd~agent-workload-obj-delete-command~1]
+    #[tokio::test]
+    async fn utest_workload_obj_delete_error() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, workload_command_receiver) = WorkloadCommandSender::new();
+
+        // drop the receiver so that the send command fails
+        drop(workload_command_receiver);
+
+        let mut old_control_interface_mock = MockControlInterface::default();
+        old_control_interface_mock
+            .expect_abort_control_interface_task()
+            .once()
+            .return_const(());
+
+        let test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(old_control_interface_mock),
+        );
+
+        assert!(matches!(
+            test_workload.delete().await,
+            Err(WorkloadError::Communication(_))
+        ));
+    }
+
+    // [utest->swdd~agent-compares-control-interface-metadata~2]
+    #[test]
+    fn utest_is_control_interface_changed_set_from_none_to_new_returns_true() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+        let test_workload_with_control_interface = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender.clone(),
+            None,
+        );
+        assert!(
+            test_workload_with_control_interface
+                .is_control_interface_changed(&Some(MockControlInterfaceInfo::default()))
+        );
+    }
+
+    // [utest->swdd~agent-compares-control-interface-metadata~2]
+    #[test]
+    fn utest_is_control_interface_changed_set_from_existing_to_none_returns_true() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let test_workload_with_control_interface = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender.clone(),
+            Some(MockControlInterface::default()),
+        );
+        assert!(test_workload_with_control_interface.is_control_interface_changed(&None));
+    }
+
+    // [utest->swdd~agent-compares-control-interface-metadata~2]
+    #[test]
+    fn utest_is_control_interface_changed_set_from_none_to_none_returns_false() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let test_workload_with_control_interface = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender.clone(),
+            None,
+        );
+
+        assert!(!test_workload_with_control_interface.is_control_interface_changed(&None));
+    }
+
+    // [utest->swdd~agent-compares-control-interface-metadata~2]
+    #[test]
+    fn utest_is_control_interface_changed_returns_true() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let mut control_interface_info_mock = MockControlInterfaceInfo::default();
+        control_interface_info_mock
+            .expect_has_same_configuration()
+            .once()
+            .return_const(false);
+        let test_workload_with_control_interface = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender.clone(),
+            Some(MockControlInterface::default()),
+        );
+
+        assert!(
+            test_workload_with_control_interface
+                .is_control_interface_changed(&Some(control_interface_info_mock))
+        );
+    }
+
+    // [utest->swdd~agent-compares-control-interface-metadata~2]
+    #[test]
+    fn utest_is_control_interface_changed_returns_false() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let mut control_interface_info_mock = MockControlInterfaceInfo::default();
+        control_interface_info_mock
+            .expect_has_same_configuration()
+            .once()
+            .return_const(true);
+
+        let test_workload_with_control_interface = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender.clone(),
+            Some(MockControlInterface::default()),
+        );
+
+        assert!(
+            !test_workload_with_control_interface
+                .is_control_interface_changed(&Some(control_interface_info_mock))
+        );
+    }
+
+    // [utest->swdd~agent-control-interface-created-for-eligible-workloads~1]
+    #[test]
+    fn utest_exchange_control_interface_not_created() {
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            None,
+        );
+
+        let workload =
+            generate_test_workload_with_params(fixtures::AGENT_NAMES[0], fixtures::RUNTIME_NAMES[0]);
+
+        test_workload.exchange_control_interface(None, workload.needs_control_interface());
+
+        assert!(test_workload.control_interface.is_none());
+    }
+
+    // [utest->swdd~agent-workload-obj-update-command~2]
+    #[tokio::test]
+    async fn utest_workload_obj_update_success() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, mut workload_command_receiver) = WorkloadCommandSender::new();
+
+        let mut old_control_interface_mock = MockControlInterface::default();
+        old_control_interface_mock
+            .expect_abort_control_interface_task()
+            .once()
+            .return_const(());
+
+        let workload = generate_test_workload_named();
+
+        let mut new_control_interface_mock = MockControlInterface::default();
+        new_control_interface_mock
+            .expect_get_api_location()
+            .once()
+            .return_const(CONTROL_INTERFACE_PATH.clone());
+
+        let new_control_interface_context = MockControlInterface::new_context();
+        new_control_interface_context
+            .expect()
+            .once()
+            .return_once(|_, _, _, _| Ok(new_control_interface_mock));
+
+        let mut new_control_interface_info_mock = MockControlInterfaceInfo::default();
+        new_control_interface_info_mock
+            .expect_get_control_interface_path()
+            .once()
+            .return_const(ControlInterfacePath::new("different_path".into()));
+
+        new_control_interface_info_mock
+            .expect_get_to_server_sender()
+            .once()
+            .return_const(tokio::sync::mpsc::channel::<common::to_server_interface::ToServer>(1).0);
+
+        new_control_interface_info_mock
+            .expect_get_instance_name()
+            .once()
+            .return_const(workload.instance_name.clone());
+
+        new_control_interface_info_mock
+            .expect_move_authorizer()
+            .once()
+            .return_once(MockAuthorizer::default);
+        new_control_interface_info_mock
+            .expect_has_same_configuration()
+            .once()
+            .return_const(false);
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(old_control_interface_mock),
+        );
+
+        test_workload
+            .update(
+                Some(workload.clone()),
+                Some(new_control_interface_info_mock),
+            )
+            .await
+            .unwrap();
+
+        let expected_workload = Box::new(workload);
+        let expected_pipes_path_buf = CONTROL_INTERFACE_PATH.clone();
+
+        assert_eq!(
+            Ok(Some(WorkloadCommand::Update(
+                Some(expected_workload),
+                Some(expected_pipes_path_buf)
+            ))),
+            timeout(Duration::from_millis(200), workload_command_receiver.recv()).await
+        );
+    }
+
+    // [utest->swdd~agent-workload-obj-update-command~2]
+    #[tokio::test]
+    async fn utest_workload_obj_update_error() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, workload_command_receiver) = WorkloadCommandSender::new();
+
+        // drop the receiver so that the send command fails
+        drop(workload_command_receiver);
+
+        let mut old_control_interface_mock = MockControlInterface::default();
+        old_control_interface_mock
+            .expect_abort_control_interface_task()
+            .once()
+            .return_const(());
+
+        let mut new_control_interface_mock = MockControlInterface::default();
+        new_control_interface_mock
+            .expect_get_api_location()
+            .once()
+            .return_const(CONTROL_INTERFACE_PATH.clone());
+
+        let workload = generate_test_workload_named_with_params(
+            fixtures::WORKLOAD_NAMES[0],
+            fixtures::AGENT_NAMES[0],
+            fixtures::RUNTIME_NAMES[0],
+        );
+
+        let mut new_control_interface_info_mock = MockControlInterfaceInfo::default();
+        new_control_interface_info_mock
+            .expect_get_control_interface_path()
+            .once()
+            .return_const(ControlInterfacePath::new(fixtures::PIPES_LOCATION.into()));
+
+        new_control_interface_info_mock
+            .expect_get_to_server_sender()
+            .once()
+            .return_const(tokio::sync::mpsc::channel::<common::to_server_interface::ToServer>(1).0);
+
+        new_control_interface_info_mock
+            .expect_get_instance_name()
+            .once()
+            .return_const(workload.instance_name.clone());
+
+        new_control_interface_info_mock
+            .expect_move_authorizer()
+            .once()
+            .return_once(MockAuthorizer::default);
+
+        new_control_interface_info_mock
+            .expect_has_same_configuration()
+            .once()
+            .return_const(false);
+
+        let control_interface_new_context = MockControlInterface::new_context();
+        control_interface_new_context
+            .expect()
+            .once()
+            .return_once(|_, _, _, _| Ok(new_control_interface_mock));
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(old_control_interface_mock),
+        );
+
+        assert!(matches!(
+            test_workload
+                .update(
+                    Some(workload.clone()),
+                    Some(new_control_interface_info_mock)
+                )
+                .await,
+            Err(WorkloadError::Communication(_))
+        ));
+    }
+
+    // [utest->swdd~agent-workload-obj-delete-command~1]
+    #[tokio::test]
+    async fn utest_workload_obj_delete_success() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, mut workload_command_receiver) = WorkloadCommandSender::new();
+
+        let mut old_control_interface_mock = MockControlInterface::default();
+        old_control_interface_mock
+            .expect_abort_control_interface_task()
+            .once()
+            .return_const(());
+
+        let test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(old_control_interface_mock),
+        );
+
+        test_workload.delete().await.unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_millis(200), workload_command_receiver.recv()).await,
+            Ok(Some(WorkloadCommand::Delete))
+        ));
+    }
+
+    // [utest->swdd~agent-forward-responses-to-control-interface-pipe~1]
+    #[tokio::test]
+    async fn utest_workload_obj_send_complete_state_success() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+        let (to_server_tx, mut to_server_rx) = mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        let mut control_interface_mock = MockControlInterface::default();
+        control_interface_mock
+            .expect_get_input_pipe_sender()
+            .once()
+            .return_const(to_server_tx);
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(control_interface_mock),
+        );
+        let complete_state =
+            generate_test_complete_state(vec![generate_test_workload_named_with_params(
+                fixtures::WORKLOAD_NAMES[0],
+                fixtures::AGENT_NAMES[0],
+                fixtures::RUNTIME_NAMES[0],
+            )]);
+
+        test_workload
+            .forward_response(ank_base::Response {
+                request_id: fixtures::REQUEST_ID.to_owned(),
+                response_content: Some(ank_base::response::ResponseContent::CompleteStateResponse(
+                    Box::new(complete_state.clone().into()),
+                )),
+            })
+            .await
+            .unwrap();
+
+        let expected_complete_state = complete_state;
+
+        assert!(matches!(
+            timeout(Duration::from_millis(200), to_server_rx.recv()).await,
+            Ok(Some(FromServer::Response(Response{request_id: _, response_content: Some(ResponseContent::CompleteStateResponse(complete_state))})))
+        if Some(ank_base::CompleteState::from(expected_complete_state)) == complete_state.complete_state));
+    }
+
+    // [utest->swdd~agent-forward-responses-to-control-interface-pipe~1]
+    #[tokio::test]
+    async fn utest_workload_obj_send_complete_state_pipes_communication_error() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+        let (to_server_tx, to_server_rx) = mpsc::channel(fixtures::TEST_CHANNEL_CAP);
+
+        drop(to_server_rx);
+
+        let mut control_interface_mock = MockControlInterface::default();
+        control_interface_mock
+            .expect_get_input_pipe_sender()
+            .once()
+            .return_const(to_server_tx);
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            Some(control_interface_mock),
+        );
+        let complete_state = CompleteStateSpec::default();
+
+        assert!(matches!(
+            test_workload
+                .forward_response(ank_base::Response {
+                    request_id: fixtures::REQUEST_ID.to_owned(),
+                    response_content: Some(
+                        ank_base::response::ResponseContent::CompleteStateResponse(Box::new(
+                            complete_state.clone().into()
+                        ))
+                    ),
+                })
+                .await,
+            Err(WorkloadError::CompleteState(_))
+        ));
+    }
+
+    // [utest->swdd~agent-forward-responses-to-control-interface-pipe~1]
+    #[tokio::test]
+    async fn utest_workload_obj_send_complete_state_no_control_interface() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, _) = WorkloadCommandSender::new();
+
+        let mut test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            None,
+        );
+        let complete_state = CompleteStateSpec::default();
+
+        assert!(matches!(
+            test_workload
+                .forward_response(ank_base::Response {
+                    request_id: fixtures::REQUEST_ID.to_owned(),
+                    response_content: Some(
+                        ank_base::response::ResponseContent::CompleteStateResponse(Box::new(
+                            complete_state.clone().into()
+                        )),
+                    ),
+                })
+                .await,
+            Err(WorkloadError::CompleteState(_))
+        ));
+    }
+
+    // [utest->swdd~agent-workload-obj-start-log-fetcher-command~1]
+    #[tokio::test]
+    async fn utest_workload_obj_start_collecting_logs_success() {
+        let _guard = crate::test_helper::MOCKALL_CONTEXT_SYNC
+            .get_lock_async()
+            .await;
+
+        let (workload_command_sender, mut workload_command_receiver) = WorkloadCommandSender::new();
+
+        let jh = tokio::spawn(async move {
+            let Some(WorkloadCommand::StartLogFetcher(options, result_sink)) =
+                workload_command_receiver.recv().await
+            else {
+                panic!("Did not receive StartLogCollection command")
+            };
+            assert_eq!(options, LOG_REQUEST_OPTIONS);
+            result_sink.send(Box::new(MockLogFetcher::new())).unwrap();
+        });
+
+        let test_workload = Workload::new(
+            fixtures::WORKLOAD_NAMES[0].to_string(),
+            workload_command_sender,
+            None,
+        );
+
+        test_workload
+            .start_collecting_logs(LOG_REQUEST_OPTIONS)
+            .await
+            .unwrap();
+
+        jh.await.unwrap();
+    }
+}

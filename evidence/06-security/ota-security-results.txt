@@ -1,0 +1,52 @@
+MISSION OTA - SECURITY TEST EVIDENCE
+====================================
+
+Release:
+mission-ota-v2.tar.gz
+
+Target:
+Eclipse Leda
+
+VALID PACKAGE
+--------------
+
+SHA-256:
+306e8d334d883b53eded3e0457938208d54c34e657c99d48c1973ee9ef86c7b0
+
+SHA-256 verification:
+PASS
+
+Ed25519 signature verification:
+PASS
+
+TAMPER TEST
+-----------
+
+Tampered package:
+mission-ota-v2-tampered.tar.gz
+
+Tampered SHA-256:
+58851715d60e5a2a44d9acd50f99ad65ff05dd37d8449a801febc31494f94480
+
+Signature verification:
+FAIL / REJECTED
+
+OTA UPDATE TEST
+---------------
+
+Version 1:
+nginx:1.27-alpine
+
+Version 2:
+nginx:1.28-alpine
+
+Update:
+v1 -> v2 : PASS
+
+Rollback:
+v2 -> v1 : PASS
+
+Conclusion:
+A valid signed OTA package was accepted.
+A modified/tampered package failed signature verification.
+The OTA workload was successfully updated and rolled back.

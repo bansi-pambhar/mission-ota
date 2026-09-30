@@ -1,0 +1,251 @@
+// Copyright (c) 2025 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::dummy_state_checker::DummyStateChecker;
+use crate::runtime_connectors::{
+    LogRequestOptions, ReusableWorkloadState, RuntimeConnector, RuntimeError, RuntimeWorkloadId,
+    StateCheckerHandle, log_fetcher::LogFetcher,
+};
+use crate::workload_state::WorkloadStateSender;
+use ankaios_api::ank_base::{WorkloadInstanceNameSpec, WorkloadNamed};
+
+use async_trait::async_trait;
+use common::objects::AgentName;
+use std::{collections::HashMap, path::PathBuf};
+
+#[derive(Clone)]
+// [impl->swdd~agent-skips-unknown-runtime~2]
+pub struct UnsupportedRuntime(pub String);
+
+// [impl->swdd~agent-skips-unknown-runtime~2]
+#[async_trait]
+impl RuntimeConnector for UnsupportedRuntime {
+    fn name(&self) -> String {
+        self.0.clone()
+    }
+
+    async fn get_reusable_workloads(
+        &self,
+        _agent_name: &AgentName,
+    ) -> Result<Vec<ReusableWorkloadState>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn create_workload(
+        &self,
+        runtime_workload_config: WorkloadNamed,
+        _reusable_workload_id: Option<RuntimeWorkloadId>,
+        _control_interface_path: Option<PathBuf>,
+        _update_state_tx: WorkloadStateSender,
+        _workload_file_path_mapping: HashMap<PathBuf, PathBuf>,
+    ) -> Result<(RuntimeWorkloadId, StateCheckerHandle), RuntimeError> {
+        if runtime_workload_config.workload.runtime == self.0 {
+            Err(RuntimeError::Unsupported("Unsupported Runtime".into()))
+        } else {
+            Err(RuntimeError::Unsupported(format!(
+                "Received a manifest for the wrong runtime: '{}'",
+                runtime_workload_config.workload.runtime
+            )))
+        }
+    }
+
+    async fn get_workload_id(
+        &self,
+        _instance_name: &WorkloadInstanceNameSpec,
+    ) -> Result<RuntimeWorkloadId, RuntimeError> {
+        Err(RuntimeError::List(
+            "Cannot get information about workload with unsupported runtime".into(),
+        ))
+    }
+
+    async fn start_checker(
+        &self,
+        _workload_id: &RuntimeWorkloadId,
+        _runtime_workload_config: WorkloadNamed,
+        _update_state_tx: WorkloadStateSender,
+    ) -> Result<StateCheckerHandle, RuntimeError> {
+        Ok(Box::new(DummyStateChecker::new()))
+    }
+
+    fn get_log_fetcher(
+        &self,
+        _workload_id: RuntimeWorkloadId,
+        _options: &LogRequestOptions,
+    ) -> Result<Box<dyn LogFetcher + Send>, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "Cannot collect logs for workload with unsupported runtime".into(),
+        ))
+    }
+
+    async fn delete_workload(&self, _workload_id: &RuntimeWorkloadId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeError, UnsupportedRuntime, WorkloadInstanceNameSpec};
+    use crate::runtime_connectors::{LogRequestOptions, RuntimeConnector, RuntimeWorkloadId};
+
+    use ankaios_api::test_utils::{
+        fixtures, generate_test_workload_named, generate_test_workload_named_with_params,
+    };
+    use common::objects::AgentName;
+
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    const TEST_RUNTIME_NAME: &str = "test_runtime";
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_name_returns_runtime_name() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+
+        assert_eq!(unsupported_runtime.name(), TEST_RUNTIME_NAME.to_string());
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_get_reusable_workloads_returns_empty_vec() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let agent_name = AgentName::from(fixtures::AGENT_NAMES[0]);
+
+        let result = unsupported_runtime
+            .get_reusable_workloads(&agent_name)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_create_workload_returns_unsupported_error_for_matching_runtime() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let workload = generate_test_workload_named_with_params(
+            fixtures::WORKLOAD_NAMES[0],
+            fixtures::AGENT_NAMES[0],
+            TEST_RUNTIME_NAME,
+        );
+
+        let result = unsupported_runtime
+            .create_workload(workload, None, None, mpsc::channel(1).0, HashMap::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Unsupported(msg)) if msg == "Unsupported Runtime"
+        ));
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_create_workload_returns_unsupported_error_for_different_runtime() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let workload = generate_test_workload_named_with_params(
+            fixtures::WORKLOAD_NAMES[0],
+            fixtures::AGENT_NAMES[0],
+            "different_runtime",
+        );
+
+        let result = unsupported_runtime
+            .create_workload(workload, None, None, mpsc::channel(1).0, HashMap::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Unsupported(msg)) if msg.contains("Received a manifest for the wrong runtime")
+        ));
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_get_workload_id_returns_list_error() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let instance_name = WorkloadInstanceNameSpec::new(
+            fixtures::AGENT_NAMES[0],
+            fixtures::WORKLOAD_NAMES[0],
+            fixtures::WORKLOAD_IDS[0],
+        );
+
+        let result = unsupported_runtime.get_workload_id(&instance_name).await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::List(msg)) if msg.contains("Cannot get information about workload")
+        ));
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_start_checker_returns_dummy_checker() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let workload = generate_test_workload_named();
+
+        let result = unsupported_runtime
+            .start_checker(
+                &RuntimeWorkloadId::from(fixtures::WORKLOAD_IDS[0].to_owned()),
+                workload,
+                mpsc::channel(1).0,
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_get_log_fetcher_returns_err() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+        let options = LogRequestOptions {
+            follow: false,
+            since: None,
+            until: None,
+            tail: None,
+        };
+
+        let result = unsupported_runtime.get_log_fetcher(
+            RuntimeWorkloadId::from(fixtures::WORKLOAD_IDS[0].to_owned()),
+            &options,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Unsupported(msg)) if msg.contains("Cannot collect logs for workload with unsupported runtime")
+        ));
+    }
+
+    // [utest->swdd~agent-skips-unknown-runtime~2]
+    #[tokio::test]
+    async fn utest_delete_workload_returns_ok() {
+        let unsupported_runtime = UnsupportedRuntime(TEST_RUNTIME_NAME.to_string());
+
+        let result = unsupported_runtime
+            .delete_workload(&RuntimeWorkloadId::from(
+                fixtures::WORKLOAD_IDS[0].to_owned(),
+            ))
+            .await;
+
+        assert!(result.is_ok());
+    }
+}

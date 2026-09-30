@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "ankaios_api",
+    "ank_schema",
+    "common",
+    "agent",
+    "server",
+    "spec_macros",
+    "grpc",
+    "ank",
+    "tests/resources/control_interface_tester",
+]

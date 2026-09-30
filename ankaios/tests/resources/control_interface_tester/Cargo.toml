@@ -1,0 +1,16 @@
+[package]
+name = "control_interface_tester"
+edition = "2024"
+license = "Apache-2.0"
+description = "Application using the Control Interface used for system tests"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ankaios-api = { path = "../../../ankaios_api" }
+chrono = "0.4"
+# required for encoding/decoding of protobuf varint format
+prost = "0.14"
+serde = "1.0"
+serde_yaml = "0.9"
+serde_json = "1.0.121"

@@ -1,0 +1,33 @@
+@startuml seq_get_complete_state
+!include ../../../../resources/doc/plantuml/clean.skin
+
+box "Ankaios Server"
+participant "<<thread>>\nAnkaiosServer" as server
+participant "ServerState" as server_state
+participant "<<thread>>\nGRPCCommunicationsServer" as grpc_server
+participant "<<thread>>\ntonic gRPC server" as tonic_server
+end box
+
+
+box "Ankaios Agents"
+participant "Agent" as agent
+end box
+
+activate agent
+
+...
+agent ->> tonic_server++: RequestCompleteState
+tonic_server ->> server--++: RequestCompleteState
+server -> server_state++: filter CompleteState by field_mask
+server_state -->> server--: CompleteState
+note right
+If field_mask is empty
+the full CompleteState is returned.
+end note
+server ->> grpc_server--++: CompleteState
+grpc_server ->> agent--: CompleteState
+deactivate agent
+
+
+
+@enduml

@@ -1,0 +1,5 @@
+MISSION-OTA
+Release: 2.0
+Target: Eclipse-Leda
+Component: Vehicle-Application
+Update-Type: OTA

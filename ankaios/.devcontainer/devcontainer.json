@@ -1,0 +1,53 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+    "name": "Ankaios dev",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "mounts": [],
+    "runArgs": ["--privileged"],
+    "postStartCommand": ".devcontainer/post-start.sh",
+    "customizations": {
+        "vscode": {
+            // Set *default* container specific settings.json values on container create.
+            "settings": {
+                "lldb.executable": "/usr/bin/lldb",
+                // VS Code don't watch files under ./target
+                "files.watcherExclude": {
+                    "**/target/**": true
+                },
+                "remote.autoForwardPorts": false
+            },
+            // Add the IDs of extensions you want installed when the container is created.
+            "extensions": [
+                "vadimcn.vscode-lldb",
+                "mutantdino.resourcemonitor",
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "timonwong.shellcheck",
+                "eamodio.gitlens",
+                "streetsidesoftware.code-spell-checker",
+                "jebbs.plantuml",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "yzhang.markdown-all-in-one",
+                "drblury.protobuf-vsc",
+                "bierner.markdown-preview-github-styles",
+                "hediet.vscode-drawio",
+                "redhat.vscode-yaml",
+                "bierner.markdown-mermaid",
+                "d-biehl.robotcode",
+                "bianxianyang.htmlplay",
+                "DavidAnson.vscode-markdownlint",
+                "EditorConfig.EditorConfig",
+                "ms-vsliveshare.vsliveshare",
+                "BarbossHack.crates-io",
+                "PKief.material-icon-theme"
+            ]
+        }
+    },
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/ankaios/,type=bind",
+    "workspaceFolder": "/workspaces/ankaios/",
+    "remoteUser": "vscode"
+}

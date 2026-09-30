@@ -1,0 +1,71 @@
+apiVersion: v1
+workloads:
+  nginx:
+    runtime: podman
+    agent: agent_A
+    restartPolicy: ON_FAILURE
+    tags:
+      owner: Ankaios team
+    runtimeConfig: |
+      image: docker.io/nginx:latest
+      commandOptions: ["-p", "8081:80"]
+  hello1:
+    runtime: podman
+    agent: agent_B
+    dependencies:
+      filesystem_init: ADD_COND_SUCCEEDED
+    controlInterfaceAccess:
+      allowRules:
+      - type: StateRule
+        operation: Read
+        filterMasks:
+        - desiredState
+    runtimeConfig: |
+      image: alpine:latest
+      commandOptions: [ "--rm"]
+      commandArgs: [ "echo", "Hello Ankaios"]
+  hello2:
+    runtime: podman
+    agent: agent_B
+    restartPolicy: ON_FAILURE
+    tags:
+      owner: Ankaios team
+    runtimeConfig: |
+      image: alpine:latest
+      commandOptions: [ "--entrypoint", "/bin/sh" ]
+      commandArgs: [ "-c", "echo 'Restarted on failure.'; sleep 2"]
+  hello_containerd:
+    runtime: containerd
+    agent: agent_A
+    restartPolicy: NEVER
+    tags:
+      owner: Ankaios team
+    runtimeConfig: |
+      image: ghcr.io/eclipse-ankaios/tests/alpine:latest
+      commandArgs: [ "sh", "-c", "echo 'Hello from a containerd workload.'; sleep 3;" ]
+  hello-pod:
+    runtime: podman-kube
+    agent: agent_B
+    restartPolicy: NEVER
+    tags:
+      owner: Ankaios team
+    runtimeConfig: |
+      manifest: |
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: hello-pod
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: looper
+            image: alpine:latest
+            command:
+            - sleep
+            - 50000
+          - name: greater
+            image: alpine:latest
+            command:
+            - echo
+            - "Hello from a container in a pod"
+

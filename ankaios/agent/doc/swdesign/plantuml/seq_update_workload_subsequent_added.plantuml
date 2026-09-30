@@ -1,0 +1,66 @@
+@startuml seq_update_workload_subsequent_added
+!include ../../../../resources/doc/plantuml/clean.skin
+
+box "Ankaios Agent"
+    participant "AgentManager" as manager
+
+    participant "RuntimeManager" as runtime_manager
+    participant "RuntimeFacade" as rt_facade
+
+    participant "Workload" as workload
+    participant "WorkloadCommandChannel" as workload_command
+    participant "WorkloadControlLoop" as workload_control_loop
+
+    participant "Specific Runtime Connector\n e.g., PodmanRuntime" as runtime
+
+end box
+
+activate manager
+
+...
+
+manager -> runtime_manager ++: handle update workload
+
+alt first update workload call for the current agent execution
+    ... see dedicated digram for first call ...
+else subsequent update workload call
+    ... handle deleted Workloads ...
+
+    loop for each added Worload
+        runtime_manager -> runtime_manager ++--: find workload in running workloads
+        alt found a workload with the same name in the list of running workloads
+            runtime_manager -> runtime_manager ++--: update_workload
+            note right
+                see delete digram for details on update
+            endnote
+        else no such workload found in list of running workloads \n normal behaviour
+            runtime_manager -> runtime_manager++: add workload
+            runtime_manager -> runtime_manager++--: create control interface
+            runtime_manager -> rt_facade++: request create workload
+            rt_facade ->> rt_facade ++: spawn create workload
+            runtime_manager -> runtime_manager++--: store new workload
+
+            rt_facade -> workload_control_loop ++: run
+            workload_control_loop -> workload_command ++: wait for command
+            rt_facade -> workload_command ++: send create
+            workload_command -->> rt_facade--
+            deactivate rt_facade
+
+            rt_facade -> workload **: create WorkloadObject
+            rt_facade -->> runtime_manager --
+
+            workload_command -->> workload_control_loop --++: receive create
+            opt workload has workload files assigned
+                workload_control_loop -> workload_control_loop++--: create workload files
+            end
+
+            workload_control_loop -> runtime++: create runtime workload
+            runtime -->> workload_control_loop --
+            workload_control_loop -> workload_command ++: wait for command
+
+            ...
+        end
+    end
+end
+
+@enduml

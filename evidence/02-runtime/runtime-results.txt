@@ -1,0 +1,38 @@
+MISSION OTA - RUNTIME EVIDENCE
+==============================
+
+Environment:
+Eclipse Leda QEMU x86_64
+
+Container runtime:
+containerd
+
+CLI:
+nerdctl 1.7.7
+
+Containerd:
+1.6.19.m
+
+Namespace:
+kanto-cm
+
+Existing SDV workloads verified:
+- databroker
+- feedercan
+- feedergps
+- hvacservice-
+- node-red-exa
+- seatservice-
+- sua
+
+Direct nerdctl deployment:
+nginx container successfully created and started.
+
+OTA demonstration:
+nginx:1.27-alpine -> nginx:1.28-alpine
+
+Rollback:
+nginx:1.28-alpine -> nginx:1.27-alpine
+
+Result:
+PASS

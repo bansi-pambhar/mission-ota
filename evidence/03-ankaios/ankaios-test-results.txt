@@ -1,0 +1,38 @@
+MISSION OTA - ANKAIOS TEST EVIDENCE
+===================================
+
+Date: 2026-09-30
+
+Component:
+Ankaios agent / containerd nerdctl runtime connector
+
+Source modification:
+agent/src/runtime_connectors/containerd/nerdctl_cli.rs
+
+Change:
+The nerdctl JSON Labels field can be null in the Leda environment.
+The parser was changed from requiring String to accepting Option<String>.
+
+Test command:
+cargo test -p ank-agent
+
+Result:
+559 passed
+0 failed
+0 ignored
+
+Built target:
+x86_64-unknown-linux-musl
+
+Agent deployment:
+The rebuilt ank-agent was copied to Eclipse Leda.
+
+SHA-256 of deployed agent:
+99e7527860793857c68b56accfb44cce9b1af60b00b37584e654fb47a149c958
+
+Note:
+Ankaios workload state retrieval still reports:
+"Failed(Unknown) - Error getting state from Nerdctl"
+
+The underlying nerdctl/containerd runtime was independently verified
+to successfully create and run containers.

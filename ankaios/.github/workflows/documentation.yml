@@ -1,0 +1,86 @@
+name: Documentation
+on:
+  push:
+    branches:
+      - main
+      - release-**
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "documentation-${{ github.head_ref || github.ref }}"
+  cancel-in-progress: true
+
+env:
+  ENABLED_HTMLPROOFER: false
+
+jobs:
+  documentation_changes:
+    name: Check if documentation has changed
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      documentation: ${{ steps.filter.outputs.documentation }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            documentation:
+                - 'doc/**'
+                - 'ankaios_api/proto/**'
+                - '.github/workflows/documentation.yml'
+  deploy:
+    name: Deploy documentation
+    needs: documentation_changes
+    if: ${{ needs.documentation_changes.outputs.documentation == 'true' || github.ref_name == 'main' || github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/eclipse-ankaios/devcontainer-base:1.3.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare commit to branch gh-pages
+        run: |
+          git config --global --add safe.directory $PWD
+          git config user.name ci-bot
+          git config user.email ci-bot@example.com
+          git fetch origin gh-pages --depth=1
+
+      - name: Generate documentation and deploy (push on main)
+        # execute only on push to main branch or when called by another workflow
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == 'main' }}
+        run: |
+          tools/generate_docs.sh deploy
+
+      - name: Generate documentation and deploy (for release)
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        run: |
+          # Convert tag to documentation version like v0.1.0 to 0.1
+          DOCVER=$(expr match ${{ github.ref_name }} 'v\([0-9]\+\.[0-9]\+\)\.')
+          tools/generate_docs.sh deploy-release "$DOCVER"
+
+      - name: Generate documentation (for pull requests and release branches)
+        if: ${{ github.event_name == 'pull_request' || startsWith(github.ref_name, 'release-') }}
+        run: |
+          tools/generate_docs.sh build
+  lint:
+    name: Lint documentation
+    # No dependencies as we have markdown files in a lot of places
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          show-progress: ""
+      - name: markdownlint-cli2-action
+        uses: DavidAnson/markdownlint-cli2-action@07035fd053f7be764496c0f8d8f9f41f98305101 # v22.0.0
+        with:
+          globs: |
+            **/*.md
+            !.github/PULL_REQUEST_TEMPLATE.md

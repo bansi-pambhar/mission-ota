@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Cleanup Ankaios ....
+echo "Cleaning up Ankaios ..."
+pkill ank-agent
+pkill ank-server
+echo "done."
+
+if which podman > /dev/null; then
+    echo "Cleaning up podman ..."
+    podman stop -a >/dev/null 2>&1
+    podman rm -a >/dev/null 2>&1
+    podman volume rm -a >/dev/null 2>&1
+    podman pod stop -a >/dev/null 2>&1
+    podman pod rm -fa >/dev/null 2>&1
+    echo "done."
+fi
+
+if pgrep -x "containerd" > /dev/null; then
+    echo "Cleaning up containerd ..."
+    nerdctl stop "$(nerdctl ps -a -q)" >/dev/null 2>&1
+    nerdctl rm "$(nerdctl ps -a -q)" >/dev/null 2>&1
+    echo "done."
+fi
+
+# Cleanup certs
+echo "Cleaning up certs ..."
+rm -rf .certs
+echo "done."
+
+
+# Cleanup tls env
+echo "Cleaning up tls env ..."
+unset ANK_CA_PEM
+unset ANK_CRT_PEM
+unset ANK_KEY_PEM
+echo "done."
+
+# Cleanup temp files
+echo "Cleaning up /tmp/ankaios ..."
+rm -rf /tmp/ankaios
+echo "done."

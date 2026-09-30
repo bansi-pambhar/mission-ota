@@ -1,0 +1,12 @@
+[package]
+name = "control_interface_example"
+edition = "2024"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ankaios-api = { path = "ankaios_api" }
+chrono = "0.4"
+# required for encoding/decoding of protobuf varint format
+prost = "0.14"

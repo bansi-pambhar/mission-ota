@@ -1,0 +1,25 @@
+@startuml seq_store_workload_state
+!include ../../../../resources/doc/plantuml/clean.skin
+
+box "Ankaios Server"
+    participant "Ankaios Server" as server
+end box
+
+box "Ankaios Agent"
+    participant "Listen to Ankaios\nServer task" as listen_to_server
+    participant "AgentManager" as manager
+    participant "WorkloadStateStore" as wl_state_store
+end box
+
+activate server
+
+server ->> listen_to_server --++: UpdateWorkloadState
+note left
+        ""agentName: Agent 1""
+end note
+listen_to_server ->> manager --++: UpdateWorkloadState
+
+loop for each workload in the list
+    manager -> wl_state_store --++: update_workload_state
+end
+@enduml

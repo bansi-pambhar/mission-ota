@@ -1,0 +1,4 @@
+/target
+*stderr.log
+*.bb
+go

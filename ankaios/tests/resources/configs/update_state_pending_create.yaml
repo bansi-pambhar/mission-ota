@@ -1,0 +1,24 @@
+desiredState:
+  apiVersion: v1
+  workloads:
+    after_backend:
+      agent: agent_A
+      tags:
+        owner: Ankaios team
+      dependencies:
+        backend: ADD_COND_SUCCEEDED
+      restartPolicy: NEVER
+      runtime: podman
+      runtimeConfig: |
+        image: ghcr.io/eclipse-ankaios/tests/alpine:latest
+        commandArgs: ["echo", "Changed runtime config."]
+    backend:
+      agent: agent_A
+      tags:
+        owner: Ankaios team
+      dependencies: {}
+      restartPolicy: NEVER
+      runtime: podman
+      runtimeConfig: |
+        image: ghcr.io/eclipse-ankaios/tests/alpine:latest
+        commandArgs: ["echo", "backend succeeded"]

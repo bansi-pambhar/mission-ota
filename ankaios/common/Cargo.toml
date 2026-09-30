@@ -1,0 +1,34 @@
+[package]
+name = "common"
+version = "1.1.0-pre"
+edition = "2024"
+license = "Apache-2.0"
+description = "Common containers and utilities for Eclipse Ankaios"
+documentation = "https://eclipse-ankaios.github.io/ankaios"
+authors = ["Elektrobit Automotive GmbH and Ankaios contributors"]
+repository = "https://github.com/eclipse-ankaios/ankaios"
+
+[dependencies]
+ankaios-api = { path = "../ankaios_api" }
+async-trait = "0.1"
+tokio = { version = "1.41", features = [
+    "macros",
+    "rt-multi-thread",
+    "fs",
+    "io-util",
+    "process",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+log = "0.4"
+prost = "0.14"
+semver = "1.0"
+toml = "0.9"
+
+[dev-dependencies]
+ankaios-api = { path = "../ankaios_api", features = ["test_utils"] }
+tempfile = "3.17"
+
+[features]
+default = []
+test_utils = []

@@ -1,0 +1,17 @@
+MISSION OTA - UPSTREAM SOURCE COMMITS
+======================================
+
+Ankaios:
+4aed3cabc82f433d0de7d5ed86007c64324bb4d6
+
+Eclipse Leda:
+61a65347daf1530caa4a5bf6a9ad80a6e6787499
+
+Leda Utils:
+561ce1483dc6c457cefcf51c4c94a6ca3904fe54
+
+Leda Distro:
+6c7adb162a2faaccbb7341a3f9e49ed4d7f999bd
+
+uUpdate:
+ebcf60d60e97a3b2dbcf052fc7e3b3a0e0f9204b

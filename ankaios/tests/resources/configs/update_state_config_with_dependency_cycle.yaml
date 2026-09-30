@@ -1,0 +1,15 @@
+desiredState:
+  apiVersion: v1
+  workloads:
+    workload_C:
+      runtime: podman
+      agent: agent_B
+      restartPolicy: NEVER
+      dependencies:
+        workload_D: ADD_COND_SUCCEEDED
+        workload_A: ADD_COND_RUNNING
+      tags:
+        owner: Ankaios team
+      runtimeConfig: |
+        image: ghcr.io/eclipse-ankaios/tests/alpine:latest
+        commandArgs: [ "echo", "Hello Ankaios"]

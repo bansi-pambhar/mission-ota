@@ -1,0 +1,112 @@
+// Copyright (c) 2024 Elektrobit Automotive GmbH
+//
+// This program and the accompanying materials are made available under the
+// terms of the Apache License, Version 2.0 which is available at
+// https://www.apache.org/licenses/LICENSE-2.0.
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations
+// under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use ankaios_api::ank_base::Request;
+use ankaios_api::control_api;
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToAnkaios {
+    Request(Request),
+    Hello(Hello),
+}
+
+// [impl->swdd~agent-converts-control-interface-message-to-ankaios-object~1]
+impl TryFrom<control_api::ToAnkaios> for ToAnkaios {
+    type Error = String;
+
+    fn try_from(item: control_api::ToAnkaios) -> Result<Self, Self::Error> {
+        use control_api::to_ankaios::ToAnkaiosEnum;
+        let to_ankaios = item
+            .to_ankaios_enum
+            .ok_or("ToAnkaios is None.".to_string())?;
+
+        Ok(match to_ankaios {
+            ToAnkaiosEnum::Request(content) => ToAnkaios::Request(content),
+            ToAnkaiosEnum::Hello(content) => ToAnkaios::Hello(content.into()),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Hello {
+    pub protocol_version: String,
+}
+
+impl From<control_api::Hello> for Hello {
+    fn from(item: control_api::Hello) -> Self {
+        Hello {
+            protocol_version: item.protocol_version,
+        }
+    }
+}
+
+impl Hello {
+    pub fn new() -> Self {
+        Hello {
+            protocol_version: common::ANKAIOS_VERSION.into(),
+        }
+    }
+}
+
+impl Default for Hello {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//                 ########  #######    #########  #########                //
+//                    ##     ##        ##             ##                    //
+//                    ##     #####     #########      ##                    //
+//                    ##     ##                ##     ##                    //
+//                    ##     #######   #########      ##                    //
+//////////////////////////////////////////////////////////////////////////////
+
+#[cfg(test)]
+mod tests {
+    use super::{ToAnkaios, control_api};
+    use ankaios_api::ank_base::{
+        CompleteStateRequest, Request, RequestContent,
+    };
+    use ankaios_api::test_utils::fixtures;
+
+    const FIELD_1: &str = "field_1";
+    const FIELD_2: &str = "field_2";
+
+    // [utest->swdd~agent-converts-control-interface-message-to-ankaios-object~1]
+    #[test]
+    fn utest_convert_control_interface_proto_to_ankaios_object() {
+        let proto_request = control_api::ToAnkaios {
+            to_ankaios_enum: Some(control_api::to_ankaios::ToAnkaiosEnum::Request(Request {
+                request_id: fixtures::REQUEST_ID.into(),
+                request_content: Some(RequestContent::CompleteStateRequest(CompleteStateRequest {
+                    field_mask: vec![FIELD_1.into(), FIELD_2.into()],
+                    subscribe_for_events: false,
+                })),
+            })),
+        };
+
+        let expected = ToAnkaios::Request(Request {
+            request_id: fixtures::REQUEST_ID.into(),
+            request_content: Some(RequestContent::CompleteStateRequest(CompleteStateRequest {
+                field_mask: vec![FIELD_1.into(), FIELD_2.into()],
+                subscribe_for_events: false,
+            })),
+        });
+
+        let converted = ToAnkaios::try_from(proto_request).unwrap();
+        assert_eq!(converted, expected);
+    }
+}

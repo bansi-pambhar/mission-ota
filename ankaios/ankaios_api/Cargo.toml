@@ -1,0 +1,28 @@
+[package]
+name = "ankaios-api"
+version = "1.1.0-pre"
+edition = "2024"
+license = "Apache-2.0"
+description = "API definition for Eclipse Ankaios"
+documentation = "https://eclipse-ankaios.github.io/ankaios"
+authors = ["Elektrobit Automotive GmbH and Ankaios contributors"]
+repository = "https://github.com/eclipse-ankaios/ankaios"
+
+[dependencies]
+spec_macros = { path = "../spec_macros" }
+prost = "0.14"
+tonic = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+sha256 = "1.5"
+regex = "1.12"
+log = "0.4"
+schemars = "1.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[features]
+default = []
+test_utils = []
